@@ -11,7 +11,7 @@ import unicodedata
 from datetime import datetime
 from typing import Optional
 import cv2
-import easyocr
+# import easyocr
 import httpx
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header
@@ -23,6 +23,17 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from ine_ocr_v2 import extraer_ine_frente_v2, extraer_ine_reverso_v2, combinar_ine_v2
+
+reader = None
+
+def get_reader():
+    global reader
+    if reader is None:
+        import easyocr
+        print("⚡ Cargando EasyOCR...")
+        reader = easyocr.Reader(['es', 'en'])
+        print("✅ Motor OCR Listo.")
+    return reader
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 GROQ_API_KEY          = os.getenv("GROQ_API_KEY", "")
@@ -77,10 +88,6 @@ except Exception as e:
     SUPABASE_DISPONIBLE = False
 
 app = FastAPI(title="SmartDocs OCR", version="3.5")
-
-print("⚡ Cargando EasyOCR...")
-reader = easyocr.Reader(['es', 'en'])
-print("✅ Motor OCR Listo.")
 ocr_semaphore = asyncio.Semaphore(1) 
 
 OcrResult = list[tuple]
@@ -232,14 +239,21 @@ def limpiar_ocr(resultado_ocr: OcrResult) -> OcrResult:
 
 def leer_codigos(file_bytes: bytes, filename: str) -> list[dict]:
     img_bgr = bytes_a_bgr(file_bytes, filename)
-    codigos = pyzbar.decode(img_bgr)
+    detector = cv2.QRCodeDetector()
+    # Intento 1 (normal)
+    data, bbox, _ = detector.detectAndDecode(img_bgr)
+
+    # Intento 2 (escala si falla)
+    if not data:
+        img_small = cv2.resize(img_bgr, None, fx=0.5, fy=0.5)
+        data, bbox, _ = detector.detectAndDecode(img_small)
     resultados = []
-    for c in codigos:
-        try:
-            data = c.data.decode('utf-8')
-        except UnicodeDecodeError:
-            data = c.data.decode('latin-1', errors='ignore')
-        resultados.append({"tipo": c.type, "datos": data})
+    if data:
+        resultados.append({
+            "tipo": "QRCODE",
+            "datos": data
+        })
+
     return resultados
 
 
