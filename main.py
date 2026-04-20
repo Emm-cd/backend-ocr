@@ -2147,7 +2147,7 @@ async def analizar_documento(
     try:
         contenido   = await archivo.read()
         imagen, cal = preprocesar(contenido, archivo.filename)
-        ocr_result  = reader.readtext(imagen, detail=1)
+        ocr_result = get_reader().readtext(imagen, detail=1)
         texto       = texto_plano(ocr_result)
 
         codigos                  = leer_codigos(contenido, archivo.filename)
@@ -2190,8 +2190,8 @@ async def analizar_ine(
         img_r, cal_r = preprocesar_ine(b_reverso, reverso.filename)
 
         # ── OCR + limpieza (limpiar_ocr es clave para INE) ────────────────
-        ocr_f_raw = reader.readtext(img_f, detail=1)
-        ocr_r_raw = reader.readtext(img_r, detail=1)
+        ocr_f_raw = get_reader().readtext(img_f, detail=1)
+        ocr_r_raw = get_reader().readtext(img_r, detail=1)
         ocr_f     = limpiar_ocr(ocr_f_raw)
         ocr_r     = limpiar_ocr(ocr_r_raw)
 
@@ -2537,7 +2537,7 @@ async def analizar_y_actualizar(
  
         # ── OCR en thread separado ─────────────────────────────────────────
         async with ocr_semaphore:
-            ocr_result = await asyncio.to_thread(reader.readtext, imagen, detail=1)
+            ocr_result = await asyncio.to_thread(get_reader().readtext, imagen, detail=1)
         texto = texto_plano(ocr_result)
  
         # ── Segunda verificación: ¿fue cancelado MIENTRAS corría el OCR? ──
@@ -2661,9 +2661,10 @@ async def analizar_ine_y_actualizar(
         img_r, cal_r = preprocesar_ine(b_reverso, reverso.filename or "reverso.jpg")
  
         # ── OCR en paralelo (¡la clave de la velocidad!) ───────────────────
+        _reader = get_reader()  # obtener una vez, reutilizar
         ocr_f, ocr_r = await asyncio.gather(
-            asyncio.to_thread(reader.readtext, img_f, detail=1),
-            asyncio.to_thread(reader.readtext, img_r, detail=1),
+            asyncio.to_thread(_reader.readtext, img_f, detail=1),
+            asyncio.to_thread(_reader.readtext, img_r, detail=1),
         )
  
         codigos_f = leer_codigos(b_frente,  frente.filename or "frente.jpg")
