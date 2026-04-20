@@ -1,5 +1,7 @@
-# Usamos la versión estable que resolvía el problema de libgl1
 FROM python:3.11-slim-bullseye
+
+# ¡ESTA LÍNEA ES LA MAGIA! Obliga a Python a mostrar los logs en vivo
+ENV PYTHONUNBUFFERED=1
 
 # Instalamos Poppler y herramientas de video
 RUN apt-get update && apt-get install -y \
@@ -15,5 +17,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Usamos sh -c para que evalúe la variable $PORT correctamente como número
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
+# Usamos bash para asegurarnos de que la variable $PORT se lea bien
+CMD ["bash", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
