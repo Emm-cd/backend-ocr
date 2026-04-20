@@ -1,18 +1,26 @@
 FROM python:3.11-slim-bullseye
 
+# ── Logs en vivo ──────────────────────────────────────────────────────────────
 ENV PYTHONUNBUFFERED=1
-ENV EASYOCR_MODULE_PATH=/app/.EasyOCR
 
+# ── Dependencias del sistema ──────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y \
-    poppler-utils libgl1 libglib2.0-0 \
+    poppler-utils \
+    libgl1 \
+    libglib2.0-0 \
+    tesseract-ocr \
+    tesseract-ocr-spa \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Directorio de trabajo ─────────────────────────────────────────────────────
 WORKDIR /app
+
+# ── Dependencias Python ───────────────────────────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ← Descarga modelos durante el BUILD (no en runtime)
-RUN python -c "import easyocr; easyocr.Reader(['es', 'en'], gpu=False)"
-
+# ── Código fuente ─────────────────────────────────────────────────────────────
 COPY . .
+
+# ── Arranque ──────────────────────────────────────────────────────────────────
 CMD ["bash", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
