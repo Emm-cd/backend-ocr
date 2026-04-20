@@ -1,0 +1,15 @@
+# Variables de entorno — NUNCA subir
+.env
+.env.local
+.env.production
+
+# Carpetas de Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# EasyOCR descarga modelos aquí
+~/.EasyOCR/
