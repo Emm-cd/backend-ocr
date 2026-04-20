@@ -16,7 +16,7 @@ import httpx
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header
 from pdf2image import convert_from_bytes
-from pyzbar import pyzbar
+# from pyzbar import pyzbar
 from groq_service import generar_resumen_groq
 from groq import Groq
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
