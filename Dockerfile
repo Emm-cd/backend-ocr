@@ -1,7 +1,7 @@
-# Usamos una versión un poco más robusta pero igual de ligera
+# Usamos la versión estable que resolvía el problema de libgl1
 FROM python:3.11-slim-bullseye
 
-# Instalamos Poppler y la versión correcta de libgl1
+# Instalamos Poppler y herramientas de video
 RUN apt-get update && apt-get install -y \
     poppler-utils \
     libgl1 \
@@ -15,6 +15,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE $PORT
-
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Usamos sh -c para que evalúe la variable $PORT correctamente como número
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
