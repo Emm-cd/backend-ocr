@@ -1,21 +1,18 @@
 FROM python:3.11-slim-bullseye
 
-# ¡ESTA LÍNEA ES LA MAGIA! Obliga a Python a mostrar los logs en vivo
 ENV PYTHONUNBUFFERED=1
+ENV EASYOCR_MODULE_PATH=/app/.EasyOCR
 
-# Instalamos Poppler y herramientas de video
 RUN apt-get update && apt-get install -y \
-    poppler-utils \
-    libgl1 \
-    libglib2.0-0 \
+    poppler-utils libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# ← Descarga modelos durante el BUILD (no en runtime)
+RUN python -c "import easyocr; easyocr.Reader(['es', 'en'], gpu=False)"
 
-# Usamos bash para asegurarnos de que la variable $PORT se lea bien
+COPY . .
 CMD ["bash", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
