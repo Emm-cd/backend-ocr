@@ -14,6 +14,8 @@ import cv2
 import httpx
 import numpy as np
 import pytesseract
+from datetime import datetime, timedelta
+import re
 
 pytesseract.pytesseract.tesseract_cmd = r'C:/Program Files/Tesseract-OCR/tesseract.exe'
 
@@ -1446,27 +1448,24 @@ def extraer_acta_nacimiento(resultado_ocr: OcrResult) -> dict:
 
     return datos
 
-def extraer_reporte_derrame(resultado_ocr):
+def extraer_reporte_derrame(resultado_ocr) -> dict:
     """
-    Extrae los campos clave de un reporte de derrame (industrial,
-    aeroportuario, etc.) desde el resultado OCR.
-
-    Campos extraídos:
-        folio_informe, fecha_incidente, hora_incidente,
-        ubicacion_lugar, tipo_derrame, volumen_derrame,
-        causa_derrame, estado_contenedor, medidas_contencion,
-        reportado_por, empresa_responsable,
-        numero_vuelo, matricula_aeronave,
-        fecha_limite_pago (CALCULADO: fecha_incidente + 30 días),
-        dias_para_vencer, vencido
+    Extrae campos del Reporte de Derrame (AIQ / DocFlow Technologies).
+ 
+    Cambios v3.5.1:
+      - fecha_limite_pago calculada dinámicamente (fecha_incidente + 30 días).
+        Ya NO se busca por OCR/regex.
+      - Nuevo campo tipo_combustible (ej. "Jet A-1").
+      - ubicacion_lugar: regex reescrito + fallback posicional para eliminar
+        el ruido "/ POSICION:" que devolvía Tesseract.
+      - medidas_contencion: parser de tabla B mejorado; devuelve lista limpia
+        de insumos con cantidad y unidad.
     """
-    from datetime import datetime, timedelta
-
     datos = {}
-    texto   = texto_plano(resultado_ocr)
-    lineas  = _lineas_ordenadas(resultado_ocr)
-
-    # ── Folio del informe ────────────────────────────────────────────────
+    texto = texto_plano(resultado_ocr)
+    lineas = _lineas_ordenadas(resultado_ocr)
+ 
+    # ── Folio del informe ────────────────────────────────────────────────────
     for pat in [
         r'FOLIO\s+INFORME\s*[:\-]?\s*([A-Z0-9\-]{4,30})',
         r'FOLIO\s*[:\-]?\s*([A-Z0-9\-]{4,30})',
@@ -1476,10 +1475,9 @@ def extraer_reporte_derrame(resultado_ocr):
         if m:
             datos['folio_informe'] = campo(m.group(1).strip(), 0.9)
             break
-
-    # ── Fecha del incidente ──────────────────────────────────────────────
+ 
+    # ── Fecha del incidente ──────────────────────────────────────────────────
     fecha_incidente_iso: str | None = None
-    fecha_raw = None
     for pat in [
         r'FECHA\s+(?:DEL?\s+)?INCIDENTE\s*[:\-]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})',
         r'FECHA\s+(?:DEL?\s+)?EVENTO\s*[:\-]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})',
@@ -1487,21 +1485,19 @@ def extraer_reporte_derrame(resultado_ocr):
     ]:
         m = re.search(pat, texto, re.IGNORECASE)
         if m:
-            fecha_raw = m.group(1).strip()
+            raw = m.group(1).strip()
+            for fmt in ('%d/%m/%Y', '%d-%m-%Y', '%Y/%m/%d', '%Y-%m-%d'):
+                try:
+                    fecha_incidente_iso = datetime.strptime(raw, fmt).strftime('%Y-%m-%d')
+                    datos['fecha_incidente'] = campo(fecha_incidente_iso, 0.9)
+                    break
+                except ValueError:
+                    continue
+            if 'fecha_incidente' not in datos:
+                datos['fecha_incidente'] = campo(raw, 0.75)
             break
-
-    if fecha_raw:
-        for fmt in ('%d/%m/%Y', '%d-%m-%Y', '%Y/%m/%d', '%Y-%m-%d'):
-            try:
-                fecha_incidente_iso = datetime.strptime(fecha_raw, fmt).strftime('%Y-%m-%d')
-                datos['fecha_incidente'] = campo(fecha_incidente_iso, 0.9)
-                break
-            except ValueError:
-                continue
-        if 'fecha_incidente' not in datos:
-            datos['fecha_incidente'] = campo(fecha_raw, 0.75)
-
-    # ── Hora del incidente ───────────────────────────────────────────────
+ 
+    # ── Hora del incidente ───────────────────────────────────────────────────
     for pat in [
         r'HORA\s*[:\-]?\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:HRS?|AM|PM)?',
         r'(\d{1,2}:\d{2})\s*HRS?',
@@ -1511,186 +1507,263 @@ def extraer_reporte_derrame(resultado_ocr):
         if m:
             datos['hora_incidente'] = campo(m.group(1).strip(), 0.85)
             break
-
-    # ── Ubicación / lugar ────────────────────────────────────────────────
-    # ESTRATEGIA DUAL: el nuevo formato del PDF pone la etiqueta en una línea
-    # y el valor en la siguiente. Se intenta primero en línea y luego por posición.
-
+ 
+    # ── Ubicación / lugar  ───────────────────────────────────────────────────
+    # PROBLEMA ANTERIOR: el regex capturaba el texto de la misma etiqueta
+    # ("/ POSICION:") porque Tesseract puede pegarlo al valor en la misma línea.
+    # SOLUCIÓN:
+    #   1. Regex que descarta explícitamente palabras de la etiqueta al inicio.
+    #   2. Fallback posicional: tomar la línea SIGUIENTE a la que contiene
+    #      "UBICACION" o "POSICION" si la línea actual no tiene valor limpio.
+ 
+    _ETIQUETA_UBIC = re.compile(
+        r'UBICACI[OÓ]N\s*/?\s*POSICI[OÓ]N|UBICACI[OÓ]N|POSICI[OÓ]N',
+        re.IGNORECASE,
+    )
+    _RUIDO_UBIC = re.compile(
+        r'^[\s:/\-|]*(?:POSICI[OÓ]N|UBICACI[OÓ]N|TIPO|B\.|A\.)',
+        re.IGNORECASE,
+    )
+ 
     ubicacion_encontrada = False
-
-    # Intento 1 — valor en la misma línea (PDF con texto en una sola línea)
+ 
+    # Intento 1: regex con valor al final de la línea de etiqueta
     for pat in [
-        r'UBICACI[OÓ]N\s*/?\s*POSICI[OÓ]N\s*[:\-]\s*([^\n/]{5,100}?)(?:\s{2,}|TIPO|A\.|B\.|$)',
-        r'POSICI[OÓ]N\s+DE\s+CONTACTO[^\n]{0,80}',
-        r'POSICI[OÓ]N\s*[:\-]\s*([^\n/]{5,80}?)(?:\s{2,}|TIPO|A\.|B\.|$)',
-        r'UBICACI[OÓ]N\s*[:\-]\s*([^\n/]{5,80}?)(?:\s{2,}|TIPO|A\.|B\.|$)',
-        r'LUGAR\s+(?:DEL?\s+)?(?:INCIDENTE|EVENTO|DERRAME)\s*[:\-]\s*([^\n]{5,80}?)(?:\s{2,}|$)',
+        # "UBICACIÓN / POSICIÓN: Posición de Contacto 03 (Plataforma Comercial Rampa)"
+        r'UBICACI[OÓ]N\s*/?\s*POSICI[OÓ]N\s*[:\-]?\s*'
+        r'((?:POSICI[OÓ]N\s+DE\s+CONTACTO|GATE|PUERTA|RAMPA|PISTA|HANGAR)[^\n]{2,100})',
+        r'POSICI[OÓ]N\s*[:\-]?\s*(POSICI[OÓ]N\s+DE\s+CONTACTO[^\n]{2,80})',
+        r'UBICACI[OÓ]N\s*[:\-]?\s*((?!POSICI[OÓ]N\s*[:\-])(?!TIPO)[^\n]{5,100})',
+        r'LUGAR\s+(?:DEL?\s+)?(?:INCIDENTE|EVENTO|DERRAME)\s*[:\-]?\s*(.{5,80}?)(?:\n|$)',
+        r'INSTALACI[OÓ]N\s*[:\-]?\s*(.{5,80}?)(?:\n|$)',
     ]:
         m = re.search(pat, texto, re.IGNORECASE)
         if m:
-            val = m.group(0) if 'POSICION DE CONTACTO' in pat.upper() else m.group(1)
-            val = val.strip().rstrip('.,;:')
-            if len(val) >= 5 and not re.fullmatch(r'[/\s:\-]+', val):
+            val = m.group(1).strip().rstrip('.,;')
+            # Rechazar si el valor empieza con palabras de la etiqueta misma
+            if not _RUIDO_UBIC.match(val) and len(val) >= 5:
                 datos['ubicacion_lugar'] = campo(val, 0.85)
                 ubicacion_encontrada = True
                 break
-
-    # Intento 2 — valor en la(s) línea(s) siguiente(s) a la etiqueta
+ 
+    # Intento 2: fallback posicional — línea siguiente a la etiqueta
     if not ubicacion_encontrada:
-        etiquetas_ubic = [
-            'UBICACION / POSICION', 'UBICACIÓN / POSICIÓN',
-            'UBICACION/POSICION', 'UBICACIÓN/POSICIÓN',
-            'POSICION:', 'POSICIÓN:', 'UBICACION:', 'UBICACIÓN:',
-        ]
         for i, (_, txt, conf) in enumerate(lineas):
-            txt_up = txt.upper()
-            if any(e in txt_up for e in etiquetas_ubic):
-                partes_valor = []
-                j = i + 1
-                while j < len(lineas) and len(partes_valor) < 2:
-                    sig_txt = lineas[j][1].strip()
-                    if sig_txt and not re.match(
-                        r'^(TIPO\s+DE|A\.|B\.|C\.|DATOS\s+GENERALES)', sig_txt, re.I
-                    ):
-                        partes_valor.append(sig_txt)
-                    j += 1
-                if partes_valor:
-                    val = ' '.join(partes_valor).strip().rstrip('.,;')
-                    datos['ubicacion_lugar'] = campo(val, 0.8)
+            if _ETIQUETA_UBIC.search(txt):
+                # Buscar próxima línea que no sea otra etiqueta
+                for j in range(i + 1, min(i + 4, len(lineas))):
+                    _, sig, cs = lineas[j]
+                    if not _RUIDO_UBIC.match(sig) and len(sig.strip()) >= 5:
+                        datos['ubicacion_lugar'] = campo(sig.strip().rstrip('.,;'), round(cs, 3))
+                        break
                 break
-
-    # ── Tipo de derrame / combustible ────────────────────────────────────
-    tipo_derrame_txt = None
-    tipo_combustible_txt = None
-
+ 
+    # ── Tipo de derrame / tipo de evento ────────────────────────────────────
     m = re.search(
-        r'TIPO\s+DE\s+DERRAME\s*[:\-]?\s*([^\n\u2022\u25cf]{3,60}?)(?:\n|TIPO|$)',
+        r'TIPO\s+DE\s+DERRAME\s*[:\-]?\s*(.{3,60}?)(?:\n|TIPO\s+DE\s+EVENTO|$)',
         texto, re.IGNORECASE
     )
     if m:
-        tipo_derrame_txt = m.group(1).strip().rstrip('.,;')
-
+        datos['tipo_derrame'] = campo(m.group(1).strip().rstrip('.,;'), 0.9)
+ 
     m = re.search(
-        r'TIPO\s+DE\s+COMBUSTIBLE\s*[:\-]?\s*([^\n\u2022\u25cf]{3,40}?)(?:\n|TIPO|$)',
+        r'TIPO\s+DE\s+EVENTO\s*[:\-]?\s*(.{3,60}?)(?:\n|$)',
         texto, re.IGNORECASE
     )
-    if not m:
-        m = re.search(r'(JET\s+[AB]\-?\d?)\b', texto, re.IGNORECASE)
     if m:
-        tipo_combustible_txt = m.group(1).strip()
-
-    if tipo_derrame_txt and tipo_combustible_txt:
-        datos['tipo_derrame'] = campo(f"{tipo_derrame_txt}: {tipo_combustible_txt}", 0.9)
-    elif tipo_combustible_txt:
-        datos['tipo_derrame'] = campo(f"Combustible: {tipo_combustible_txt}", 0.85)
-    elif tipo_derrame_txt:
-        datos['tipo_derrame'] = campo(tipo_derrame_txt, 0.8)
-
-    # ── Volumen derramado ────────────────────────────────────────────────
+        datos['tipo_evento'] = campo(m.group(1).strip().rstrip('.,;'), 0.85)
+ 
+    # ── Tipo de combustible (nuevo campo) ────────────────────────────────────
+    # Captura "Jet A-1", "Turbosín", "Avgas", "100LL", etc.
     for pat in [
-        r'VOLUMEN\s+ESTIMADO\s+DERRAMADO\s*[:\-]?\s*([\d,\.]+\s*(?:LITROS?|LTS?|GALONES?|M3|KG))',
-        r'VOLUMEN\s+(?:DEL?\s+)?DERRAME\s*[:\-]?\s*([\d,\.]+\s*(?:LITROS?|LTS?|GALONES?|M3|KG))',
-        r'CANTIDAD\s+DERRAMADA\s*[:\-]?\s*([\d,\.]+\s*(?:LITROS?|LTS?|GALONES?|M3|KG))',
+        r'TIPO\s+DE\s+COMBUSTIBLE\s*[:\-]?\s*(.{2,40}?)(?:\n|$)',
+        r'COMBUSTIBLE\s*[:\-]?\s*(JET\s+[A-Z0-9\-]+)',
+        r'\b(JET\s+[A-Z]\-?\d+)\b',
+        r'\b(TURBOSIN|AVGAS|100\s*LL|JP\-?\d+)\b',
+    ]:
+        m = re.search(pat, texto, re.IGNORECASE)
+        if m:
+            val = m.group(1).strip().rstrip('.,;')
+            if val:
+                datos['tipo_combustible'] = campo(val, 0.9)
+                break
+ 
+    # Si tipo_combustible existe, enriquecer tipo_derrame con él
+    if 'tipo_combustible' in datos and 'tipo_derrame' in datos:
+        td_val = datos['tipo_derrame']['valor']
+        tc_val = datos['tipo_combustible']['valor']
+        # Añadir el combustible al tipo_derrame si no está ya incluido
+        if tc_val.upper() not in td_val.upper():
+            datos['tipo_derrame'] = campo(
+                f"{td_val}: {tc_val}",
+                datos['tipo_derrame']['confianza'],
+                fuente=datos['tipo_derrame']['fuente'],
+            )
+ 
+    # ── Volumen derramado ────────────────────────────────────────────────────
+    for pat in [
+        r'VOLUMEN\s+ESTIMADO\s+DERRAMADO\s*[:\-]?\s*([\d,\.]+\s*(?:LITROS?|LTS?|L|GALONES?|M3|KG|KILOGRAMOS?))',
+        r'VOLUMEN\s+(?:DEL?\s+)?DERRAME\s*[:\-]?\s*([\d,\.]+\s*(?:LITROS?|LTS?|L|GALONES?|M3|KG))',
+        r'CANTIDAD\s+DERRAMADA\s*[:\-]?\s*([\d,\.]+\s*(?:LITROS?|LTS?|L|GALONES?|M3|KG))',
+        r'([\d,\.]+\s*LITROS?)',
+        r'([\d,\.]+\s*GALONES?)',
     ]:
         m = re.search(pat, texto, re.IGNORECASE)
         if m:
             datos['volumen_derrame'] = campo(m.group(1).strip(), 0.85)
             break
-
-    # ── Causa del derrame ────────────────────────────────────────────────
+ 
+    # ── Medidas de contención — tabla B mejorada ─────────────────────────────
+    # El OCR de Tesseract produce un bloque ruidoso cuando lee la tabla.
+    # Estrategia: buscar cada insumo conocido + su cantidad/unidad de forma
+    # independiente y construir una cadena limpia.
+ 
+    _INSUMOS_PATRONES = [
+        # (nombre_limpio, regex_cantidad_opcional)
+        (
+            'Polvo Absorbente Mineral',
+            r'POLVO\s+ABSORBENTE\s+(?:MINERAL\s*)?[^\n]{0,20}?([\d,\.]+)\s*(KG|KILOGRAMOS?|COSTALES?)?',
+        ),
+        (
+            'Líquido Desengrasante Biodegradable',
+            r'L[IÍ]QUIDO\s+DESENGRASANTE\s*(?:BIODEGRADABLE\s*)?[^\n]{0,20}?([\d,\.]+)\s*(LITROS?|L|LTS?)?',
+        ),
+        (
+            'Kits EPP',
+            r'KITS?\s+EPP[^\n]{0,40}?([\d,\.]+)?\s*(?:KITS?\s+COMPLETOS?|UNIDADES?)?',
+        ),
+        (
+            'Cordón Absorbente',
+            r'CORD[OÓ]N(?:ES)?\s+ABSORBENTE[^\n]{0,40}?([\d,\.]+)?\s*(M|METROS?|ML)?',
+        ),
+        (
+            'Paños Absorbentes',
+            r'PA[NÑ]OS?\s+ABSORBENTES?[^\n]{0,40}?([\d,\.]+)?',
+        ),
+        (
+            'Arena',
+            r'\bARENA\b[^\n]{0,30}?([\d,\.]+)?\s*(KG|KILOGRAMOS?|SACOS?)?',
+        ),
+        (
+            'Aserrín',
+            r'ASER[RÍ]N[^\n]{0,30}?([\d,\.]+)?\s*(KG|KILOGRAMOS?)?',
+        ),
+        (
+            'Berma',
+            r'BERM(?:AS?)[^\n]{0,40}?([\d,\.]+)?',
+        ),
+        (
+            'Bomberos SEI',
+            r'BOMBEROS\s+SEI[^\n]{0,60}',
+        ),
+    ]
+ 
+    insumos_limpios: list[str] = []
+ 
+    for nombre, pat_insumo in _INSUMOS_PATRONES:
+        m = re.search(pat_insumo, texto, re.IGNORECASE)
+        if not m:
+            continue
+        # Intentar capturar cantidad y unidad del match
+        try:
+            cantidad = m.group(1).strip() if m.lastindex and m.lastindex >= 1 and m.group(1) else None
+        except IndexError:
+            cantidad = None
+        try:
+            unidad = m.group(2).strip() if m.lastindex and m.lastindex >= 2 and m.group(2) else None
+        except IndexError:
+            unidad = None
+ 
+        if cantidad and unidad:
+            # Normalizar unidad
+            unidad_norm = unidad.rstrip('s').capitalize()
+            if 'KG' in unidad.upper() or 'KILOGRAM' in unidad.upper():
+                unidad_norm = 'kg'
+            elif unidad.upper() in ('L', 'LT', 'LTS', 'LITRO', 'LITROS'):
+                unidad_norm = 'L'
+            elif 'M' == unidad.upper() or 'METRO' in unidad.upper():
+                unidad_norm = 'm'
+            insumos_limpios.append(f"{nombre} ({cantidad} {unidad_norm})")
+        elif cantidad:
+            insumos_limpios.append(f"{nombre} ({cantidad})")
+        else:
+            insumos_limpios.append(nombre)
+ 
+    # Fallback: si no detectamos nada con el parser de insumos,
+    # buscar el bloque de la sección B y limpiar el texto
+    if not insumos_limpios:
+        m_bloque = re.search(
+            r'B[\.\s]*INSUMOS?\s+Y\s+RECURSOS?[^\n]*\n(.+?)(?:\nC[\.\s]|\Z)',
+            texto, re.IGNORECASE | re.DOTALL
+        )
+        if m_bloque:
+            bloque = m_bloque.group(1)
+            # Eliminar encabezados de columna conocidos
+            for hdr in ['INSUMO', 'RECURSO', 'CANTIDAD', 'CONSUMIDA', 'UNIDAD',
+                        'MEDIDA', 'APLICACION', 'DESTINO', 'KILOGRAMOS', 'LITROS']:
+                bloque = re.sub(hdr, '', bloque, flags=re.IGNORECASE)
+            bloque = re.sub(r'[\|/\\]{2,}', ' ', bloque)
+            bloque = re.sub(r'\s{2,}', ' ', bloque).strip()
+            if len(bloque) >= 10:
+                insumos_limpios.append(bloque[:300])
+ 
+    if insumos_limpios:
+        datos['medidas_contencion'] = campo(
+            ', '.join(insumos_limpios),
+            0.85,
+        )
+ 
+    # ── Empresa responsable ──────────────────────────────────────────────────
     for pat in [
-        r'CAUSA\s+(?:DEL?\s+)?(?:DERRAME|INCIDENTE|EVENTO)\s*[:\-]?\s*([^\n\u2022\u25cf]{5,120}?)(?:\n|$)',
-        r'MOTIVO\s*[:\-]?\s*([^\n]{5,120}?)(?:\n|$)',
-        r'CAUSA\s+PROBABLE\s*[:\-]?\s*([^\n]{5,120}?)(?:\n|$)',
-        r'ORIGEN\s+DEL?\s+(?:DERRAME|FUGA)\s*[:\-]?\s*([^\n]{5,120}?)(?:\n|$)',
+        r'AEROL[IÍ]NEA\s+RESPONSABLE\s*[:\-]?\s*([A-Za-záéíóúÁÉÍÓÚÑñ][A-Za-záéíóúÁÉÍÓÚÑñ\s\.\-]{2,50}?)(?:\n|$)',
+        r'EMPRESA\s+RESPONSABLE\s*[:\-]?\s*(.{3,60}?)(?:\n|$)',
+        r'EMPRESA\s+CONTRATISTA\s*[:\-]?\s*(.{3,60}?)(?:\n|$)',
+        r'CONTRATISTA\s*[:\-]?\s*(.{3,60}?)(?:\n|$)',
+        r'OPERADOR\s*[:\-]?\s*(.{3,60}?)(?:\n|$)',
     ]:
         m = re.search(pat, texto, re.IGNORECASE)
         if m:
             val = m.group(1).strip().rstrip('.,;')
-            if len(val) >= 5:
-                datos['causa_derrame'] = campo(val, 0.75)
+            if len(val) >= 3:
+                datos['empresa_responsable'] = campo(val, 0.8)
                 break
-
-    # ── Estado del contenedor ────────────────────────────────────────────
-    # SOLO buscar con etiqueta explícita.
-    # NO usar "DERRAMADO" como keyword libre: aparece en "VOLUMEN ESTIMADO DERRAMADO"
-    for pat in [
-        r'ESTADO\s+DEL?\s+(?:CONTENEDOR|TANQUE|ENVASE|RECIPIENTE)\s*[:\-]?\s*([^\n]{3,80}?)(?:\n|$)',
-        r'CONDICI[OÓ]N\s+DEL?\s+(?:CONTENEDOR|TANQUE)\s*[:\-]?\s*([^\n]{3,80}?)(?:\n|$)',
-        r'(?:ESTADO|CONDICION)\s*[:\-]\s*(FISURADO|ROTO|DA[ÑN]ADO|PERFORADO|ABIERTO|VOLCADO)\b',
-    ]:
-        m = re.search(pat, texto, re.IGNORECASE)
-        if m:
-            datos['estado_contenedor'] = campo(m.group(1).strip(), 0.75)
-            break
-
-    # ── Medidas de contención — tabla estructurada (Sección B) ───────────
-    # ESTRATEGIA: buscar insumos conocidos + sus cantidades en ventanas
-    # cortas de texto. Evita el ruido de Tesseract en celdas de tabla.
-
-    def _extraer_insumos_tabla(texto_completo: str) -> list[str]:
-        insumos_encontrados = []
-
-        # (nombre canónico, patrón nombre, patrón cantidad)
-        INSUMOS = [
-            ('Polvo Absorbente Mineral',
-             r'POLVO\s+ABSORBENTE(?:\s+MINERAL)?',
-             r'([\d,\.]+)\s*(KG|KILOGRAMOS?)(?:\s*\([^)]*\))?'),
-            ('Líquido Desengrasante Biodegradable',
-             r'L[IÍ]QUIDO\s+DESENGRASANTE(?:\s+BIODEGRADABLE)?',
-             r'([\d,\.]+)\s*(LITROS?|LTS?)'),
-            ('Kits EPP',
-             r'KITS?\s+EPP',
-             r'(\d+)\s*(KITS?\s+COMPLETOS?|UNIDADES?|KIT)'),
-            ('Bomberos SEI',
-             r'BOMBEROS?\s+SEI|APOYO\s+(?:PREVENTIVO\s+)?BOMBEROS?',
-             r'(\d+)\s*(UNIDADES?|CAMIONES?|UNIDAD\s+T\-\d+)'),
-            ('Arena',
-             r'\bARENA\b',
-             r'([\d,\.]+)\s*(KG|SACOS?|COSTALES?)'),
-            ('Cordón absorbente',
-             r'CORD[OÓ]N(?:ES)?\s+ABSORBENTE',
-             r'([\d,\.]+)\s*(METROS?|M)'),
-            ('Paños absorbentes',
-             r'PA[ÑN]OS?\s+ABSORBENTE',
-             r'(\d+)\s*(PIEZAS?|PZA?|UNIDADES?)'),
+ 
+    if 'empresa_responsable' not in datos:
+        AEROLINEAS = [
+            'VOLARIS', 'AEROMEXICO', 'VIVA AEROBUS', 'VIVAAEROBUS', 'INTERJET',
+            'MAGNICHARTERS', 'AEROMAR', 'CONVIASA', 'AMERICAN AIRLINES',
+            'UNITED', 'DELTA', 'SOUTHWEST', 'ALASKA', 'WESTJET',
         ]
-
-        for nombre_canon, pat_nombre, pat_cant in INSUMOS:
-            m_n = re.search(pat_nombre, texto_completo, re.IGNORECASE)
-            if not m_n:
-                continue
-            # Buscar cantidad en los 120 chars siguientes al nombre
-            ventana = texto_completo[m_n.start(): m_n.start() + 120]
-            m_c = re.search(pat_cant, ventana, re.IGNORECASE)
-            if m_c:
-                num    = m_c.group(1)
-                unidad = m_c.group(2).upper()
-                if 'KG' in unidad or 'KILOGRAM' in unidad:
-                    insumos_encontrados.append(f"{nombre_canon} ({num} kg)")
-                elif 'LITRO' in unidad or 'LT' in unidad:
-                    insumos_encontrados.append(f"{nombre_canon} ({num} L)")
-                elif 'KIT' in unidad:
-                    insumos_encontrados.append(f"{nombre_canon} ({num} kit(s))")
-                elif 'UNIDAD' in unidad or 'CAMION' in unidad:
-                    insumos_encontrados.append(f"{nombre_canon} ({num} unidad(es))")
-                else:
-                    insumos_encontrados.append(f"{nombre_canon} ({num})")
-            else:
-                insumos_encontrados.append(nombre_canon)
-
-        return insumos_encontrados
-
-    insumos_limpios = _extraer_insumos_tabla(texto)
-    if insumos_limpios:
-        datos['medidas_contencion'] = campo(', '.join(insumos_limpios), 0.85)
-
-    # ── Reportado por ────────────────────────────────────────────────────
+        for al in AEROLINEAS:
+            if al in texto.upper():
+                datos['empresa_responsable'] = campo(al.title(), 0.7)
+                break
+ 
+    # ── Número de vuelo ──────────────────────────────────────────────────────
+    m = re.search(
+        r'(?:N[UÚ]MERO\s+DE\s+VUELO|VUELO\s+N[OÚ]?\.?)\s*[:\-]?\s*([A-Z]{2,3}[\-\s]?\d{3,4})\b',
+        texto, re.IGNORECASE
+    )
+    if not m:
+        # Fallback: patrón de código IATA libre
+        m = re.search(r'\b([A-Z]{2,3}[\-]?\d{3,4})\b', texto)
+    if m:
+        datos['numero_vuelo'] = campo(m.group(1).strip(), 0.85)
+ 
+    # ── Matrícula de aeronave ────────────────────────────────────────────────
+    m = re.search(
+        r'MATR[IÍ]CULA\s+(?:AERONAVE\s*)?[:\-]?\s*([A-Z]{2}\-[A-Z]{3})\b',
+        texto, re.IGNORECASE
+    )
+    if not m:
+        m = re.search(r'\b(XA\-[A-Z]{3}|N\d{3,5}[A-Z]{0,2}|EC\-[A-Z]{3})\b', texto)
+    if m:
+        datos['matricula_aeronave'] = campo(m.group(1).strip(), 0.85)
+ 
+    # ── Reportado por ────────────────────────────────────────────────────────
     for pat in [
-        r'OFICIAL\s+DE\s+OPERACIONES?\s*(?:\(OPP\))?\s*[:\-]?\s*(?:O\.?\s*P\.?\s+)?'
-        r'([A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ\s\.]{4,60}?)(?:\n|FECHA|CARGO|LA\s+FECHA|$)',
-        r'(?:OPP|SUPERVISOR|RESPONSABLE|REPORTADO?\s+POR)\s*[:\-\(]?\s*(?:O\.?P\.?\s+)?'
-        r'([A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ\s\.]{4,50}?)(?:\n|FECHA|CARGO|$)',
+        r'(?:OFICIAL\s+DE\s+OPERACIONES?|OPP|SUPERVISOR|RESPONSABLE|REPORTADO?\s+POR)\s*[:\-\(]?\s*'
+        r'(?:O\.P\.?)?\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ\s\.]{4,50}?)(?:\n|FECHA|CARGO|$)',
         r'NOMBRE\s+(?:DEL?\s+)?(?:SUPERVISOR|RESPONSABLE|OFICIAL)\s*[:\-]?\s*'
         r'([A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ\s]{4,50}?)(?:\n|$)',
     ]:
@@ -1700,72 +1773,38 @@ def extraer_reporte_derrame(resultado_ocr):
             if len(val.split()) >= 2:
                 datos['reportado_por'] = campo(val, 0.8)
                 break
-
-    # ── Empresa responsable ──────────────────────────────────────────────
+ 
+    # ── Causa del derrame ────────────────────────────────────────────────────
     for pat in [
-        r'AEROL[IÍ]NEA\s+RESPONSABLE\s*[:\-]?\s*([^\n\u2022\u25cf]{2,50}?)(?:\n|$)',
-        r'EMPRESA\s+RESPONSABLE\s*[:\-]?\s*([^\n]{3,60}?)(?:\n|$)',
-        r'EMPRESA\s+CONTRATISTA\s*[:\-]?\s*([^\n]{3,60}?)(?:\n|$)',
+        r'CAUSA\s+(?:DEL?\s+)?(?:DERRAME|INCIDENTE|EVENTO)\s*[:\-]?\s*(.{5,120}?)(?:\n|$)',
+        r'MOTIVO\s*[:\-]?\s*(.{5,120}?)(?:\n|$)',
+        r'CAUSA\s+PROBABLE\s*[:\-]?\s*(.{5,120}?)(?:\n|$)',
     ]:
         m = re.search(pat, texto, re.IGNORECASE)
         if m:
             val = m.group(1).strip().rstrip('.,;')
-            if len(val) >= 3:
-                datos['empresa_responsable'] = campo(val, 0.8)
+            if len(val) >= 5:
+                datos['causa_derrame'] = campo(val, 0.75)
                 break
-
-    if 'empresa_responsable' not in datos:
-        AEROLINEAS = [
-            'VOLARIS', 'AEROMEXICO', 'VIVA AEROBUS', 'VIVAAEROBUS', 'INTERJET',
-            'MAGNICHARTERS', 'AEROMAR', 'AMERICAN', 'UNITED', 'DELTA',
-            'SOUTHWEST', 'ALASKA', 'WESTJET',
-        ]
-        for al in AEROLINEAS:
-            if al in texto.upper():
-                datos['empresa_responsable'] = campo(al.title(), 0.7)
-                break
-
-    # ── Número de vuelo ──────────────────────────────────────────────────
-    m = re.search(
-        r'(?:N[UÚ]MERO\s+DE\s+VUELO|N[UÚ]M\.?\s*VUELO|VUELO)\s*[:\-]?\s*([A-Z]{2,3}[\-\s]?\d{3,4})\b',
-        texto, re.IGNORECASE
-    )
-    if m:
-        datos['numero_vuelo'] = campo(m.group(1).strip(), 0.85)
-
-    # ── Matrícula de aeronave ────────────────────────────────────────────
-    m = re.search(r'MATR[IÍ]CULA\s+(?:AERONAVE\s*)?[:\-]?\s*([A-Z]{2}\-[A-Z]{3})\b',
-                  texto, re.IGNORECASE)
-    if not m:
-        m = re.search(r'\b(XA\-[A-Z]{3}|XB\-[A-Z]{3}|N\d{3,5}[A-Z]{0,2}|EC\-[A-Z]{3})\b', texto)
-    if m:
-        datos['matricula_aeronave'] = campo(m.group(1).strip(), 0.85)
-
-    # ── Fecha límite de pago — CALCULADA (no OCR) ────────────────────────
-    # Regla: fecha_incidente + 30 días naturales.
-    # Si el texto menciona un plazo diferente (ej. "45 días naturales"), se usa ese.
-    # fuente = 'calculado' para diferenciarlo del OCR.
-    dias_plazo = 30
-    m_plazo = re.search(r'(\d+)\s+D[IÍ]AS?\s+NATURALES?', texto, re.IGNORECASE)
-    if m_plazo:
-        try:
-            dias_plazo = int(m_plazo.group(1))
-        except ValueError:
-            pass
-
+ 
+    # ── fecha_limite_pago — CALCULADA (no OCR) ───────────────────────────────
+    # Regla de negocio: 30 días naturales después de la fecha del incidente.
+    # NO se busca en el texto del documento.
     if fecha_incidente_iso:
         try:
-            fecha_inc_dt  = datetime.strptime(fecha_incidente_iso, '%Y-%m-%d')
-            fecha_limite  = fecha_inc_dt + timedelta(days=dias_plazo)
-            fecha_lim_iso = fecha_limite.strftime('%Y-%m-%d')
-            dias          = calcular_dias_vencimiento(fecha_lim_iso)
-            datos['fecha_limite_pago'] = campo(fecha_lim_iso, 1.0, fuente='calculado')
+            fecha_lp = (
+                datetime.strptime(fecha_incidente_iso, '%Y-%m-%d') + timedelta(days=30)
+            ).strftime('%Y-%m-%d')
+            dias = calcular_dias_vencimiento(fecha_lp)
+            datos['fecha_limite_pago'] = campo(fecha_lp, 1.0, fuente='calculado')
             datos['dias_para_vencer']  = dias
             datos['vencido']           = dias is not None and dias < 0
-        except Exception:
-            pass
-
+        except ValueError:
+            pass  # fecha_incidente_iso malformada; se omite el cálculo
+ 
     return datos
+
+
 
 # ===========================================================================
 # EXTRACCIÓN — Formato CURP
@@ -2111,6 +2150,19 @@ async def _extraer_datos_qr_first(
         datos_ocr.update(extraer_acta_nacimiento(resultado_ocr))
     elif tipo_doc == "REPORTE_DERRAME":
         datos_ocr.update(extraer_reporte_derrame(resultado_ocr))
+        if 'numero_acta' not in datos_ocr:
+            for cod in codigos:
+                if cod.get('tipo') == 'CODE128':
+                    info = parsear_code128_acta(cod['datos'])
+                    if info.get('numero_acta_codigo'):
+                        datos_ocr['numero_acta'] = campo(info['numero_acta_codigo'], 0.9, fuente='CODE128')
+                    if info.get('clave_renapo'):
+                        datos_ocr.setdefault('clave_renapo', campo(info['clave_renapo'], 0.9, fuente='CODE128'))
+                    if info.get('curp_code128'):
+                        datos_ocr.setdefault('curp', campo(
+                            info['curp_code128'], 0.99,
+                            validar_curp(info['curp_code128']), fuente='CODE128'))
+                    break
 
     datos_finales    = combinar_datos_qr_ocr(datos_ocr, datos_qr_formateados)
     fuente_principal = "QR" if datos_qr_formateados else "OCR"
@@ -2118,123 +2170,25 @@ async def _extraer_datos_qr_first(
     return datos_finales, fuente_principal, datos_qr_formateados, modelo_qr
 
 
-# main.py (Añadir helper para actualizar Supabase en caso de error o éxito)
-
-async def _actualizar_documento(doc_id: str, uid: str, payload: dict):
-    """Actualiza los campos de un documento en la tabla 'documentos' de Supabase."""
-    if not SUPABASE_DISPONIBLE:
-        return
+async def _guardar_historial(doc_id: str, uid: str, evento: str, detalle: str):
     try:
-        from supabase_service import get_supabase_client
-        supabase = get_supabase_client()
-        supabase.from_("documentos").update(payload).eq("id", doc_id).eq("usuario_id", uid).execute()
-    except Exception as e:
-        print(f"❌ Error actualizando estado en Supabase (_actualizar_documento): {e}")
-
-async def _guardar_historial(doc_id: str, uid: str, estado: str, detalle: str):
-    """Guarda un evento de auditoría en la tabla de historial."""
-    if not SUPABASE_DISPONIBLE:
-        return
-    try:
-        from supabase_service import get_supabase_client
-        supabase = get_supabase_client()
-        supabase.from_("historial_procesamiento").insert({
-            "documento_id": doc_id,
-            "usuario_id": uid,
-            "estado": estado,
-            "detalle": detalle
+        from supabase_service import supabase as sb
+        sb.table("historial_documentos").insert({
+            "uid_usuario": uid,
+            "doc_id":      doc_id,
+            "evento":      evento,
+            "detalle":     detalle,
         }).execute()
     except Exception as e:
-        print(f"⚠ Error registrando historial: {e}")
+        print(f"⚠ historial error: {e}")
 
-# ===========================================================================
-# RESUMEN — REPORTE_DERRAME (prompt especializado vía Groq)
-# ===========================================================================
 
-async def generar_resumen_reporte_derrame(datos: dict) -> str:
-    """
-    Genera un resumen operativo conciso para un reporte de derrame.
-    Usa groq_client directamente con un prompt específico del dominio.
-    No menciona términos técnicos de OCR.
-    """
-
-    def _val(key: str, default: str = "no especificado") -> str:
-        v = datos.get(key)
-        if v is None:
-            return default
-        return v.get("valor", default) if isinstance(v, dict) else str(v)
-
-    # Construir contexto compacto
-    folio      = _val("folio_informe", "sin folio")
-    fecha      = _val("fecha_incidente", "sin fecha")
-    hora       = _val("hora_incidente", "")
-    ubicacion  = _val("ubicacion_lugar", "ubicación no especificada")
-    tipo_d     = _val("tipo_derrame", "")
-    volumen    = _val("volumen_derrame", "volumen no especificado")
-    aerolinea  = _val("empresa_responsable", "empresa no identificada")
-    vuelo      = _val("numero_vuelo", "")
-    matricula  = _val("matricula_aeronave", "")
-    medidas    = _val("medidas_contencion", "no registradas")
-    oficial    = _val("reportado_por", "no registrado")
-    fecha_lim  = _val("fecha_limite_pago", "")
-    dias_v     = datos.get("dias_para_vencer")
-
-    hora_str      = f" a las {hora} hrs" if hora else ""
-    vuelo_str     = f", vuelo {vuelo}" if vuelo else ""
-    matricula_str = f" (aeronave {matricula})" if matricula else ""
-    tipo_str      = f" de {tipo_d}" if tipo_d else ""
-    lim_str       = f" La fecha límite de pago es {fecha_lim}." if fecha_lim else ""
-
-    if dias_v is not None:
-        if dias_v < 0:
-            alerta_str = f" ⚠️ El plazo de pago VENCIÓ hace {abs(dias_v)} días."
-        elif dias_v <= 30:
-            alerta_str = f" ⚠️ Quedan {dias_v} días para el vencimiento del plazo de pago."
-        else:
-            alerta_str = f" Restan {dias_v} días para el vencimiento del plazo de pago."
-    else:
-        alerta_str = ""
-
-    contexto = (
-        f"Folio: {folio}. "
-        f"Fecha: {fecha}{hora_str}. "
-        f"Ubicación: {ubicacion}. "
-        f"Aerolínea: {aerolinea}{vuelo_str}{matricula_str}. "
-        f"Derrame{tipo_str} de {volumen}. "
-        f"Medidas aplicadas: {medidas}. "
-        f"Reportó: {oficial}.{lim_str}{alerta_str}"
-    )
-
-    prompt_sistema = (
-        "Eres el asistente de DocuManager. "
-        "Escribe un resumen operativo en español, máximo 3 oraciones, "
-        "dirigido al responsable administrativo del aeropuerto. "
-        "Incluye: aerolínea, aeronave, fecha y ubicación del incidente, "
-        "sustancia y volumen derramado, medidas de contención aplicadas, "
-        "y si hay alerta de vencimiento de pago. "
-        "Usa lenguaje claro y directo. No menciones OCR, confianza ni APIs. "
-        "Responde SOLO con el resumen, sin saludos ni encabezados."
-    )
-
+async def _actualizar_documento(doc_id: str, uid: str, campos: dict):
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": prompt_sistema},
-                {"role": "user",   "content": contexto},
-            ],
-            max_tokens=200,
-            temperature=0.2,
-        )
-        return response.choices[0].message.content.strip()
+        from supabase_service import supabase as sb
+        sb.table("documentos").update(campos).eq("id", doc_id).execute()
     except Exception as e:
-        print(f"⚠ Groq resumen derrame: {e}")
-        # Fallback sin IA
-        return (
-            f"Reporte de derrame{tipo_str} ({folio}) registrado el {fecha}{hora_str} "
-            f"en {ubicacion}, correspondiente a {aerolinea}{vuelo_str}{matricula_str}. "
-            f"Volumen derramado: {volumen}. Medidas de contención: {medidas}.{lim_str}{alerta_str}"
-        )
+        print(f"⚠ update documento error: {e}")
 
 
 # ===========================================================================
@@ -2286,42 +2240,66 @@ Responde SOLO con el resumen, sin introducción ni conclusión."""
 # ===========================================================================
 
 def calcular_estado_vencimiento(datos: dict, tipo_doc: str = "") -> dict:
-    dias    = datos.get('dias_para_vencer')
-    vencido = datos.get('vencido', False)
-
-    if vencido:
-        return {"estado": "VENCIDO", "alerta": True, "urgencia": "alta"}
-
-    if dias is not None and dias <= DIAS_ALERTA_VENCIMIENTO:
-        return {"estado": "PROXIMO_VENCER", "alerta": True, "urgencia": "media", "dias_restantes": dias}
-
-    if dias is not None:
-        return {"estado": "VIGENTE", "alerta": False, "dias_restantes": dias}
-
-    # ── REPORTE_DERRAME — fecha_limite_pago calculada, sin fecha = aún no procesado
+    """
+    Calcula el estado de vencimiento de un documento.
+ 
+    Para REPORTE_DERRAME: usa fecha_limite_pago (calculada) en lugar de
+    fecha_vencimiento, que no existe en este tipo de documento.
+    """
+    # ── REPORTE_DERRAME: vencimiento basado en fecha_limite_pago ─────────────
     if tipo_doc == "REPORTE_DERRAME":
-        fecha_lim_raw = datos.get("fecha_limite_pago")
-        if fecha_lim_raw:
-            fv = fecha_lim_raw.get("valor") if isinstance(fecha_lim_raw, dict) else fecha_lim_raw
-            dias_calc = calcular_dias_vencimiento(str(fv)) if fv else None
-            if dias_calc is not None and dias_calc < 0:
-                return {"estado": "VENCIDO", "alerta": True, "urgencia": "alta"}
-            if dias_calc is not None and dias_calc <= DIAS_ALERTA_VENCIMIENTO:
-                return {
-                    "estado": "PROXIMO_VENCER", "alerta": True,
-                    "urgencia": "media", "dias_restantes": dias_calc,
-                }
-            if dias_calc is not None:
-                return {"estado": "VIGENTE", "alerta": False, "dias_restantes": dias_calc}
+        flp = datos.get('fecha_limite_pago')
+        if flp:
+            flp_val = flp.get('valor') if isinstance(flp, dict) else flp
+            if flp_val:
+                try:
+                    dias = (
+                        datetime.strptime(str(flp_val), '%Y-%m-%d') - datetime.now()
+                    ).days
+                    if dias < 0:
+                        return {
+                            "estado":       "VENCIDO",
+                            "alerta":       True,
+                            "urgencia":     "alta",
+                            "dias_restantes": dias,
+                        }
+                    if dias <= DIAS_ALERTA_VENCIMIENTO:
+                        return {
+                            "estado":       "PROXIMO_VENCER",
+                            "alerta":       True,
+                            "urgencia":     "media",
+                            "dias_restantes": dias,
+                        }
+                    return {
+                        "estado":       "VIGENTE",
+                        "alerta":       False,
+                        "dias_restantes": dias,
+                    }
+                except ValueError:
+                    pass
+        # Si no hay fecha calculada (fecha_incidente no se pudo extraer)
         return {
             "estado": "SIN_FECHA",
             "alerta": False,
             "info_adicional": (
-                "No se detectó fecha de incidente; "
-                "la fecha límite de pago no pudo calcularse."
+                "No se pudo calcular la fecha límite de pago porque la fecha del "
+                "incidente no fue detectada. Revisa el documento manualmente."
             ),
         }
-
+ 
+    # ── Resto de tipos de documento (lógica original) ─────────────────────────
+    dias    = datos.get('dias_para_vencer')
+    vencido = datos.get('vencido', False)
+ 
+    if vencido:
+        return {"estado": "VENCIDO", "alerta": True, "urgencia": "alta"}
+ 
+    if dias is not None and dias <= DIAS_ALERTA_VENCIMIENTO:
+        return {"estado": "PROXIMO_VENCER", "alerta": True, "urgencia": "media", "dias_restantes": dias}
+ 
+    if dias is not None:
+        return {"estado": "VIGENTE", "alerta": False, "dias_restantes": dias}
+ 
     if tipo_doc == "FORMATO_CURP":
         fecha_em_raw = datos.get("fecha_emision")
         if fecha_em_raw:
@@ -2332,8 +2310,8 @@ def calcular_estado_vencimiento(datos: dict, tipo_doc: str = "") -> dict:
                     dias_desde_emision = (datetime.now() - fe_date).days
                     if dias_desde_emision >= 60:
                         return {
-                            "estado": "VENCIDO",
-                            "alerta": True,
+                            "estado":   "VENCIDO",
+                            "alerta":   True,
                             "urgencia": "alta",
                             "info_adicional": (
                                 "Se recomienda usar una CURP descargada recientemente desde el portal "
@@ -2349,7 +2327,7 @@ def calcular_estado_vencimiento(datos: dict, tipo_doc: str = "") -> dict:
                 "Se recomienda usar una CURP descargada recientemente desde el portal oficial."
             ),
         }
-
+ 
     return {
         "estado": "VIGENTE",
         "alerta": False,
@@ -2359,6 +2337,7 @@ def calcular_estado_vencimiento(datos: dict, tipo_doc: str = "") -> dict:
         ),
     }
 
+ 
 
 async def notificar_n8n(payload: dict) -> None:
     if not N8N_WEBHOOK_URL:
@@ -2463,10 +2442,7 @@ async def analizar_documento(
         datos, fuente, datos_qr, modelo_qr = await _extraer_datos_qr_first(
             ocr_result, tipo_doc, codigos, datos_qr_clas)
 
-        if tipo_doc == "REPORTE_DERRAME":
-            resumen = await generar_resumen_reporte_derrame(datos)
-        else:
-            resumen = await generar_resumen_groq(tipo_doc, datos, texto)
+        resumen = await generar_resumen_groq(tipo_doc, datos, texto)
 
         if N8N_WEBHOOK_URL:
             background_tasks.add_task(
@@ -2815,19 +2791,12 @@ async def analizar_y_actualizar(
         datos, fuente, datos_qr, modelo_qr = await _extraer_datos_qr_first(
             ocr_result, tipo_doc, codigos, datos_qr_clas)
 
-        if tipo_doc == "REPORTE_DERRAME":
-            resumen = await generar_resumen_reporte_derrame(datos)
-        else:
-            resumen = await generar_resumen_groq(tipo_doc, datos, texto)
+        resumen     = await generar_resumen_groq(tipo_doc, datos, texto)
         vencimiento = calcular_estado_vencimiento(datos, tipo_doc)
         curp_ok     = isinstance(datos.get("curp"), dict) and datos["curp"].get("valido", False)
 
         fecha_venc = None
-        if tipo_doc == "REPORTE_DERRAME":
-            flp = datos.get("fecha_limite_pago")
-            if flp:
-                fecha_venc = flp.get("valor") if isinstance(flp, dict) else flp
-        elif datos.get("fecha_vencimiento"):
+        if datos.get("fecha_vencimiento"):
             fv = datos["fecha_vencimiento"]
             fecha_venc = fv["valor"] if isinstance(fv, dict) else fv
 
