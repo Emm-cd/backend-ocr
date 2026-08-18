@@ -2366,15 +2366,21 @@ def calcular_estado_vencimiento(datos: dict, tipo_doc: str = "") -> dict:
     }
 
 
-async def notificar_n8n(payload: dict) -> None:
-    if not N8N_WEBHOOK_URL:
+async def notificar_n8n(payload: dict):
+    webhook_url = os.getenv("N8N_WEBHOOK_URL")
+    if not webhook_url:
+        print("N8N_WEBHOOK_URL no configurada, se omite notificación.")
         return
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(N8N_WEBHOOK_URL, json=payload)
-            print(f"✅ n8n [{resp.status_code}] — {payload.get('documento', {}).get('tipo')}")
+            res = await client.post(webhook_url, json=payload)
+            if res.status_code == 200:
+                print("Notificación enviada a n8n correctamente.")
+            else:
+                print(f"n8n respondió con status {res.status_code} (se ignora para continuar con el flujo).")
     except Exception as e:
-        print(f"⚠ Error n8n: {e}")
+        print(f"No se pudo conectar con n8n: {e}")
 
 
 def construir_payload_n8n(tipo_doc, datos, calidad, filename, resumen,
