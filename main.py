@@ -2225,13 +2225,12 @@ async def generar_resumen_reporte_derrame(datos: dict) -> str:
 
     try:
         response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="openai/gpt-oss-20b",
             messages=[
                 {"role": "system", "content": prompt_sistema},
                 {"role": "user",   "content": contexto},
             ],
-            max_tokens=200,
-            temperature=0.2,
+            temperature=0.3,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
