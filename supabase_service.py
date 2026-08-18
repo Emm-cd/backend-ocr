@@ -160,3 +160,8 @@ async def descargar_archivo_storage(url: str) -> bytes:
         res = await client.get(url)
         res.raise_for_status()
         return res.content
+
+# Agrega esto al final de supabase_service.py:
+
+def get_supabase_client() -> Client:
+    return supabase
