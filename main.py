@@ -2194,11 +2194,11 @@ async def generar_resumen_reporte_derrame(datos: dict) -> str:
 
     if dias_v is not None:
         if dias_v < 0:
-            alerta_str = f" ⚠️ El plazo de pago VENCIÓ hace {abs(dias_v)} días."
+            alerta_str = f"El plazo de pago VENCIÓ hace {abs(dias_v)} días."
         elif dias_v <= 30:
-            alerta_str = f" ⚠️ Quedan {dias_v} días para el vencimiento del plazo de pago."
+            alerta_str = f"Quedan {dias_v} días para el vencimiento del plazo de pago."
         else:
-            alerta_str = f" Restan {dias_v} días para el vencimiento del plazo de pago."
+            alerta_str = f"Restan {dias_v} días para el vencimiento del plazo de pago."
     else:
         alerta_str = ""
 
