@@ -2134,22 +2134,22 @@ async def _actualizar_documento(doc_id: str, uid: str, payload: dict):
     try:
         from supabase_service import get_supabase_client
         supabase = get_supabase_client()
-        supabase.from_("documentos").update(payload).eq("id", doc_id).eq("usuario_id", uid).execute()
+        supabase.from_("documentos").update(payload).eq("id", doc_id).eq("uid_usuario", uid).execute()
     except Exception as e:
         print(f"❌ Error actualizando estado en Supabase (_actualizar_documento): {e}")
 
-async def _guardar_historial(doc_id: str, uid: str, estado: str, detalle: str):
+async def _guardar_historial(doc_id: str, uid: str, estado: str, mensaje: str):
     """Guarda un evento de auditoría en la tabla de historial."""
     if not SUPABASE_DISPONIBLE:
         return
     try:
         from supabase_service import get_supabase_client
         supabase = get_supabase_client()
-        supabase.from_("historial_procesamiento").insert({
-            "documento_id": doc_id,
-            "usuario_id": uid,
-            "estado": estado,
-            "detalle": detalle
+        supabase.from_("historial_documentos").insert({
+            "doc_id": doc_id,       
+            "uid_usuario": uid,    
+            "evento": estado,      
+            "detalle": mensaje,
         }).execute()
     except Exception as e:
         print(f"⚠ Error registrando historial: {e}")
