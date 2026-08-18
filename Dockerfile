@@ -1,10 +1,11 @@
 FROM python:3.11-slim-bullseye
 
-# ── Logs en vivo ──────────────────────────────────────────────────────────────
-ENV PYTHONUNBUFFERED=1
+# ── Logs en vivo y prevención de archivos .pyc ──────────────────────────────
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 # ── Dependencias del sistema ──────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     libgl1 \
     libglib2.0-0 \
@@ -22,5 +23,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ── Código fuente ─────────────────────────────────────────────────────────────
 COPY . .
 
-# ── Arranque ──────────────────────────────────────────────────────────────────
-CMD ["bash", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
+# ── Puerto de escucha por defecto (Render asigna la variable $PORT) ───────────
+EXPOSE 8000
+
+# ── Arranque (Con valor por defecto si $PORT no está configurada) ──────────────
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

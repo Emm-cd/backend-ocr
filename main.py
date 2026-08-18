@@ -14,8 +14,15 @@ import cv2
 import httpx
 import numpy as np
 import pytesseract
+import platform
 
-pytesseract.pytesseract.tesseract_cmd = r'C:/Program Files/Tesseract-OCR/tesseract.exe'
+# Configuración dinámica según el entorno
+if platform.system() == "Windows":
+    # Entorno de desarrollo local (Windows)
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+else:
+    # Entorno de producción en Render / Linux (instalado vía apt-get o Dockerfile)
+    pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header
